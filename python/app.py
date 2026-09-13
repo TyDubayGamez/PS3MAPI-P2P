@@ -5,7 +5,7 @@ The actual local application people run (this is what gets packaged into an
 .exe with PyInstaller). It's a tkinter GUI that:
   - lets you enter your username, a room code, the backend server URL, and
     your own PS3's IP
-  - joins that room over Ably (via the Vercel backend's token endpoint)
+  - joins that room by polling the Vercel/KV backend for new messages
   - shows a chat box shared by everyone in the room
   - lets you request memory reads/writes from other people in the room
   - pops up a Yes/No confirmation before ever honoring an incoming request
@@ -19,99 +19,81 @@ Build a standalone .exe with:
 
 from __future__ import annotations
 
-import asyncio
 import queue
 import threading
+import time
 import tkinter as tk
 from tkinter import messagebox, scrolledtext, ttk
 
 import requests
-from ably import AblyRealtime
 
 import ps3mapi
 
 
 # --------------------------------------------------------------------------
-# Background networking thread: owns the asyncio loop + Ably connection.
-# All Ably subscribe callbacks just push events onto `event_queue` - they
-# never touch tkinter directly, since tkinter must only be touched from the
-# main thread.
+# Background networking thread: polls the Vercel/KV backend for new events
+# and pushes them onto `event_queue` - it never touches tkinter directly,
+# since tkinter must only be touched from the main thread.
 # --------------------------------------------------------------------------
 
 class NetworkThread(threading.Thread):
-    def __init__(self, server: str, room: str, username: str, event_queue: queue.Queue):
+    def __init__(self, server: str, room: str, username: str, event_queue: queue.Queue, poll_interval: float = 1.0):
         super().__init__(daemon=True)
-        self.server = server
+        self.server = server.rstrip("/")
         self.room = room
         self.username = username
         self.event_queue = event_queue
-        self.loop: asyncio.AbstractEventLoop | None = None
-        self.ably: AblyRealtime | None = None
-        self.channel = None
+        self.poll_interval = poll_interval
+        self.since = 0
         self.connected = threading.Event()
         self.connect_error: str | None = None
+        self._stop = threading.Event()
 
     def run(self):
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
         try:
-            self.loop.run_until_complete(self._main())
+            self._post("chat", {"from": self.username, "text": f"{self.username} joined the room."})
         except Exception as e:
             self.connect_error = str(e)
             self.connected.set()
-
-    async def _main(self):
-        async def auth_callback(token_params):
-            resp = await self.loop.run_in_executor(
-                None,
-                lambda: requests.get(
-                    f"{self.server}/api/ably-auth",
-                    params={"clientId": self.username},
-                    timeout=10,
-                ),
-            )
-            resp.raise_for_status()
-            return resp.json()
-
-        self.ably = AblyRealtime(auth_callback=auth_callback)
-        await self.ably.connection.once_async("connected")
-
-        self.channel = self.ably.channels.get(f"room-{self.room}")
-
-        def on_chat(msg):
-            self.event_queue.put(("chat", msg.data))
-
-        def on_read_request(msg):
-            self.event_queue.put(("mem_read_request", msg.data))
-
-        def on_write_request(msg):
-            self.event_queue.put(("mem_write_request", msg.data))
-
-        def on_read_response(msg):
-            self.event_queue.put(("mem_read_response", msg.data))
-
-        def on_write_response(msg):
-            self.event_queue.put(("mem_write_response", msg.data))
-
-        await self.channel.subscribe("chat", on_chat)
-        await self.channel.subscribe("mem_read_request", on_read_request)
-        await self.channel.subscribe("mem_write_request", on_write_request)
-        await self.channel.subscribe("mem_read_response", on_read_response)
-        await self.channel.subscribe("mem_write_response", on_write_response)
-
-        await self.channel.publish("chat", {"from": "system", "text": f"{self.username} joined the room."})
+            return
 
         self.connected.set()
 
-        # keep the loop alive so subscriptions keep firing
-        while True:
-            await asyncio.sleep(3600)
+        while not self._stop.is_set():
+            try:
+                resp = requests.get(
+                    f"{self.server}/api/poll",
+                    params={"room": self.room, "since": self.since},
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+                for item in payload.get("messages", []):
+                    self.event_queue.put((item["event"], item.get("data") or {}))
+                self.since = payload.get("nextSince", self.since)
+            except Exception as e:
+                self.event_queue.put(("_poll_error", {"error": str(e)}))
+            time.sleep(self.poll_interval)
+
+    def _post(self, event_name: str, data: dict):
+        resp = requests.post(
+            f"{self.server}/api/send",
+            json={"room": self.room, "event": event_name, "data": data},
+            timeout=10,
+        )
+        resp.raise_for_status()
 
     def publish(self, event_name: str, data: dict):
-        """Thread-safe: call this from the tkinter (main) thread."""
-        if self.loop is None or self.channel is None:
-            return
-        asyncio.run_coroutine_threadsafe(self.channel.publish(event_name, data), self.loop)
+        """Fire-and-forget: safe to call from the tkinter (main) thread."""
+        def _send():
+            try:
+                self._post(event_name, data)
+            except Exception as e:
+                self.event_queue.put(("_poll_error", {"error": f"send failed: {e}"}))
+        threading.Thread(target=_send, daemon=True).start()
+
+    def stop(self):
+        self._stop.set()
 
 
 # --------------------------------------------------------------------------
@@ -314,6 +296,11 @@ class App(tk.Tk):
         self.after(100, self._poll_queue)
 
     def _handle_event(self, kind, data):
+        if kind == "_poll_error":
+            # Transient network hiccups are common with polling; just log them.
+            self._log(f"(connection issue: {data.get('error')})")
+            return
+
         if kind == "chat":
             if data.get("from") != self.username:
                 self._log(f"{data.get('from')}: {data.get('text')}")
